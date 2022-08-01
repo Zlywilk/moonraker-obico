@@ -13,6 +13,7 @@ import psutil
 from .utils import get_image_info, pi_version, get_tags, to_unicode
 from .janus import JANUS_SERVER
 from .webcam_capture import capture_jpeg
+from .config import Config
 
 _logger = logging.getLogger('obico.webcam_stream')
 
@@ -85,7 +86,7 @@ class WebcamStreamer:
 
 
     def video_pipeline(self):
-        if not pi_version():
+        if not pi_version() and Config.misc.klipper4a==False:
             _logger.warning('Not running on a Pi. Quiting video_pipeline.')
             return
 
