@@ -25,3 +25,6 @@ disable_video_streaming = False
 [logging]
 path = /home/pi/klipper_logs/moonraker-obico.log
 level = INFO
+
+[misc]
+klipper4a = False

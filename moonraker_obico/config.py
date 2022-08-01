@@ -109,11 +109,16 @@ class LoggingConfig:
 
 
 @dataclasses.dataclass
+class MiscConfig:
+    klipper4a: bool
+
+@dataclasses.dataclass
 class Config:
     moonraker: MoonrakerConfig
     server: ServerConfig
     webcam: WebcamConfig
     logging: LoggingConfig
+    misc: MiscConfig
 
     _config_path: str
     _config: ConfigParser
@@ -218,12 +223,20 @@ class Config:
             'misc', 'sentry_opt',
             fallback='out'
         )
+        
+        misc_config = MiscConfig(
+            klipper4a=config.get(
+                'misc', 'klipper4a',
+                fallback='false'
+            )
+		)
 
         return Config(
             moonraker=moonraker_config,
             server=tsd_config,
             webcam=webcam_config,
             logging=logging_config,
+            misc=misc_config,
             _config=config,
             _config_path=config_path,
             sentry_opt=sentry_opt,
