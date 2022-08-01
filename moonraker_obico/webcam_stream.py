@@ -94,8 +94,7 @@ class WebcamStreamer:
 
 
     def video_pipeline(self):
-        if not pi_version():
-            _logger.warning(config.misc.klipper4a)
+        if not pi_version() and config.misc.klipper4a==False:
             _logger.warning('Not running on a Pi. Quiting video_pipeline.')
             return
 
