@@ -1,3 +1,4 @@
+import argparse
 import io
 import re
 import os
@@ -19,6 +20,13 @@ _logger = logging.getLogger('obico.webcam_stream')
 
 GST_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bin', 'gst')
 FFMPEG = 'ffmpeg'
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    '-c', '--config', dest='config_path', required=True,
+    help='Path to config file (ini)'
+)
+args = parser.parse_args()
+config = Config.load_from(args.config_path)
 
 PI_CAM_RESOLUTIONS = {
     'low': ((320, 240), (480, 270)),  # resolution for 4:3 and 16:9
@@ -86,7 +94,8 @@ class WebcamStreamer:
 
 
     def video_pipeline(self):
-        if not pi_version() and Config.misc.klipper4a==False:
+        if not pi_version():
+            _logger.warning(config.misc.klipper4a)
             _logger.warning('Not running on a Pi. Quiting video_pipeline.')
             return
 
