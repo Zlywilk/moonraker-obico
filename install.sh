@@ -11,6 +11,7 @@ KLIPPER_CONF_DIR="${HOME}/klipper_config"
 MOONRAKER_CONFIG_FILE="${KLIPPER_CONF_DIR}/moonraker.conf"
 MOONRAKER_HOST="127.0.0.1"
 MOONRAKER_PORT="7125"
+OBICO_SERVICE_NAME="moonraker-obico"
 LOG_DIR="${HOME}/klipper_logs"
 OBICO_REPO="https://github.com/TheSpaghettiDetective/moonraker-obico.git"
 CURRENT_USER=${USER}
@@ -42,7 +43,6 @@ Moonraker setting options (${yellow}if any of them are specified, all need to be
           -l   The directory for moonraker-obico log files, which are rotated based on size.
           -S   The URL of the obico server to link the printer to, e.g., https://app.obico.io
 EOF
-  exit 0
 }
 
 manual_setting_warning() {
@@ -295,24 +295,6 @@ EOF
 	fi
 }
 
-prompt_for_sentry() {
-	if grep -q "sentry_opt" "${OBICO_CFG_FILE}" ; then
-		return 0
-  fi
-  echo -e "\nOne last thing: Do you want to opt in bug reporting to help us make Obico better?"
-  echo -e "The debugging info included in the report will be anonymized.\n"
-  read -p "Opt in bug reporting? [Y/n]: " -e -i "Y" opt_in
-  echo ""
-  if [ "${opt_in^^}" == "Y" ] ; then
-		cat <<EOF >> "${OBICO_CFG_FILE}"
-
-[misc]
-sentry_opt: in
-EOF
-  fi
-}
-
-
 ensure_json_parser() {
 cat <<EOF > ${JSON_PARSE_PY}
 def find(element, json):
@@ -356,41 +338,9 @@ cd ~/moonraker-obico
 ./install.sh
 -------------------------------------------------------------------------------------------------
 
-Need help? Stop by:
-
-- The Obico's help docs: https://obico.io/help/
-- The Obico community: https://obico.io/discord/
-
 EOF
+  need_help
   exit 1
-}
-
-finished() {
-  echo -e "\n\n\n"
-  banner
-  cat <<EOF
-====================================================================================================
-###                                                                                              ###
-###                                       SUCCESS!!!                                             ###
-###                             Now enjoy Obico for Klipper!                                     ###
-###                                                                                              ###
-====================================================================================================
-
-The changes we have made to your system:
-
-- System service: /etc/systemd/system/${OBICO_SERVICE_NAME}
-- Config file: ${OBICO_CFG_FILE}
-- Update file: ${OBICO_UPDATE_FILE}
-- Inserted "[include moonraker-obico-update.cfg]" in the "moonraker.conf" file
-- Log file: ${OBICO_LOG_FILE}
-
-To remove Obico for Klipper, run:
-
-cd ~/moonraker-obico
-./install.sh -u
-
-EOF
-
 }
 
 unknown_error() {
@@ -404,7 +354,7 @@ To uninstall Obico for Klipper, please run:
 
 sudo systemctl stop "${OBICO_SERVICE_NAME}"
 sudo systemctl disable "${OBICO_SERVICE_NAME}"
-sudo rm "/etc/systemd/system/${OBICO_SERVICE_NAME}"
+sudo rm "/etc/systemd/system/${OBICO_SERVICE_NAME}.service"
 sudo systemctl daemon-reload
 sudo systemctl reset-failed
 rm -rf ~/moonraker-obico
@@ -433,7 +383,7 @@ while getopts "hc:n:H:p:C:l:S:fLus" arg; do
         s) RECREATE_SERVICE="y";;
         L) SKIP_LINKING="y";;
         u) uninstall ;;
-        *) usage && exit 0;;
+        *) usage && exit 1;;
     esac
 done
 
@@ -500,9 +450,5 @@ trap - ERR
 trap - INT
 
 if [ $SKIP_LINKING != "y" ]; then
-  if "${OBICO_DIR}/link.sh" -c "${OBICO_CFG_FILE}" -n "${SUFFIX:1}"; then
-    prompt_for_sentry
-  fi
+  "${OBICO_DIR}/scripts/link.sh" -c "${OBICO_CFG_FILE}" -n "${SUFFIX:1}"
 fi
-
-finished

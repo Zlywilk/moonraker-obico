@@ -14,14 +14,13 @@ import signal
 
 import requests  # type: ignore
 
-from .wsconn import WSConn, Event
 from .version import VERSION
-from .utils import get_tags, FatalError, DEBUG, resp_to_exception, sanitize_filename
+from .utils import get_tags, sanitize_filename
 from .webcam_capture import JpegPoster
 from .logger import setup_logging
 from .printer import PrinterState
 from .config import MoonrakerConfig, ServerConfig, Config
-from .moonraker_conn import MoonrakerConn
+from .moonraker_conn import MoonrakerConn, Event
 from .server_conn import ServerConn
 from .webcam_stream import WebcamStreamer
 from .janus import JanusConn
@@ -32,11 +31,6 @@ _default_int_handler = None
 _default_term_handler = None
 
 DEFAULT_LINKED_PRINTER = {'is_pro': False}
-REQUEST_KLIPPY_STATE_TICKS = 10
-
-POST_STATUS_INTERVAL_SECONDS = 50
-if DEBUG:
-    POST_STATUS_INTERVAL_SECONDS = 10
 
 
 ACKREF_EXPIRE_SECS = 300
@@ -116,10 +110,6 @@ class App(object):
         jpeg_post_thread.daemon = True
         jpeg_post_thread.start()
 
-        thread = threading.Thread(target=self.scheduler_loop)
-        thread.daemon = True
-        thread.start()
-
         thread = threading.Thread(target=self.event_loop)
         thread.daemon = True
         thread.start()
@@ -185,26 +175,19 @@ class App(object):
             self._on_moonrakerconn_event(event)
 
     def _on_moonrakerconn_event(self, event):
-        if event.name in ('disconnected', 'connection_error', 'klippy_gone'):
-            # clear app's klippy state
-            self._received_klippy_update(
-                {
-                    "status": {},
-                    "eventtime": 0.0
-                }
-            )
-
-        elif event.name == 'moonrakerconn_ready':
-            # moonraker connection is up and initalized,
-            # let's request a full state update
-            self.moonrakerconn.request_status_update()
-
-        elif event.name == 'last_job':
-            self._received_last_print(event.data)
+        if event.name == 'mr_disconnected':
+            # clear app's klippy state to indicate the loss of connection to Moonraker
+            self._received_klippy_update({"status": {},})
 
         elif event.name == 'message':
             if 'error' in event.data:
-                _logger.debug(f'error response from moonraker, {event}')
+                _logger.warning(f'error response from moonraker, {event}')
+
+            elif event.data.get('method', '') in ('notify_klippy_disconnected', 'notify_klippy_shutdown'):
+                # notify_klippy_disconnected -> Click “Restart Klipper” or “Firmware restart” (same result)
+                # notify_klippy_shutdown -> Unplug printer USB cable
+                # clear app's klippy state to indicate the loss of connection to the printer
+                self._received_klippy_update({"status": {},})
 
             elif event.data.get('result') == 'ok':
                 # printer action response
@@ -216,59 +199,12 @@ class App(object):
                 self.moonrakerconn.request_status_update()
 
             elif event.data.get('method', '') == 'notify_history_changed':
-                for item in event.data['params']:
-                    self._received_job_action(item)
                 self.moonrakerconn.request_status_update()
 
-            elif 'status' in event.data.get('result', ()):
-                # full state update from moonraker
-                self._received_klippy_update(event.data['result'])
+        elif event.name == 'status_update':
+            # full state update from moonraker
+            self._received_klippy_update(event.data['result'])
 
-
-    def scheduler_loop(self, sleep_secs=1):
-        # scheduler for events,
-        # lightweight tasks only!
-        loops = (
-            self._recurring_klippy_status_request(),
-            # self._recurring_list_jobs_request(),
-        )
-        while self.shutdown is False:
-            for loop in loops:
-                next(loop)
-            time.sleep(sleep_secs)
-
-    def _ticks_interval(self, interval_ticks, fn, times=None, cur_counter=0):
-        tick_counter = cur_counter
-        while self.shutdown is False:
-            tick_counter -= 1
-            if tick_counter < 1:
-                tick_counter = interval_ticks
-
-                fn()
-
-                if times is not None:
-                    times -= 1
-                    if times <= 0:
-                        return
-
-            yield
-
-    def _schedule_after_ticks(self, ticks, fn):
-        return self._ticks_interval(ticks, fn, times=1, cur_counter=ticks)
-
-    def _recurring_klippy_status_request(self):
-        def enqueue():
-            if self.moonrakerconn.ready:
-                self.moonrakerconn.request_status_update()
-
-        return self._ticks_interval(REQUEST_KLIPPY_STATE_TICKS, enqueue)
-
-    def _recurring_list_jobs_request(self):
-        def enqueue():
-            if self.moonrakerconn.ready:
-                self.moonrakerconn.request_job_list(limit=3, order='desc')
-
-        return self._ticks_interval(5, enqueue)
 
     def _download_and_print(self, gcode_file):
         filename = gcode_file['filename']
@@ -302,86 +238,70 @@ class App(object):
             f'uploading "{filename}" finished.')
 
 
+    def find_current_print_ts(self, cur_status):
+        cur_job = self.moonrakerconn.find_most_recent_job()
+        if cur_job:
+            return int(cur_job.get('start_time', '0'))
+        else:
+            _logger.error(f'Active job indicate in print_stats: {cur_status}, but not in job history: {cur_job}')
+            return None
+
     def post_print_event(self, print_event):
         ts = self.model.printer_state.current_print_ts
         if ts == -1:
-            return
+            _logger.error('current_print_ts is -1 on a print_event, which is not supposed to happen.')
 
         _logger.info(f'print event: {print_event} ({ts})')
-        self.server_conn.post_status_update_to_server(print_event)
+        self.server_conn.post_status_update_to_server(print_event=print_event)
 
-    def _received_job_action(self, data):
-        _logger.info(f'received print: {data["job"]}')
-        self.model.printer_state.last_print = data['job']
-
-    def _received_last_print(self, job_data):
-        _logger.info(f'received last print: {job_data}')
-        self.model.printer_state.last_print = job_data
-        self.model.printer_state.current_print_ts = int((
-            self.model.printer_state.last_print or {}
-        ).get('start_time', -1))
 
     def _received_klippy_update(self, data):
         printer_state = self.model.printer_state
 
-        prev_state_str = printer_state.get_state_str_from(printer_state.status)
-        next_state_str = printer_state.get_state_str_from(data['status'])
+        prev_status = printer_state.update_status(data['status'])
 
-        if prev_state_str != next_state_str:
+        prev_state = PrinterState.get_state_from_status(prev_status)
+        cur_state = PrinterState.get_state_from_status(printer_state.status)
+
+        if prev_state != cur_state:
             _logger.info(
                 'detected state change: {} -> {}'.format(
-                    prev_state_str, next_state_str
+                    prev_state, cur_state
                 )
             )
-            self.boost_status_update()
 
-        printer_state.eventtime = data['eventtime']
-        printer_state.status = data['status']
+        if cur_state == PrinterState.STATE_OFFLINE:
+            printer_state.set_current_print_ts(None)  # Offline means actually printing status unknown. It may or may not be printing.
+            self.server_conn.post_status_update_to_server()
+            return
 
-        if next_state_str == 'Printing':
-            if prev_state_str == 'Printing':
-                pass
-            elif prev_state_str == 'Paused':
-                self.post_print_event('PrintResumed')
+        if printer_state.current_print_ts is None:
+            # This should cover all the edge cases when there is an active job, but current_print_ts is not set,
+            # e.g., moonraker-obico is restarted in the middle of a print
+            if printer_state.has_active_job():
+                printer_state.set_current_print_ts(self.find_current_print_ts(printer_state.status))
             else:
-                ts = int(time.time())
-                last_print = printer_state.last_print or {}
-                last_print_ts = int(last_print.get('start_time', 0))
+                printer_state.set_current_print_ts(-1)
 
-                if (
-                    # if we have data about a very recently started print
-                    last_print and
-                    last_print.get('state') == 'in_progress' and
-                    abs(ts - last_print_ts) < 20
-                ):
-                    # then let's use its timestamp
-                    if ts != last_print_ts:
-                        _logger.debug(
-                            "choosing moonraker's job start_time "
-                            "as current_print_ts")
-                    ts = last_print_ts
-
-                printer_state.current_print_ts = ts
+        if cur_state == PrinterState.STATE_PRINTING:
+            if prev_state == PrinterState.STATE_PAUSED:
+                self.post_print_event('PrintResumed')
+                return
+            if prev_state == PrinterState.STATE_OPERATIONAL:
+                printer_state.set_current_print_ts(self.find_current_print_ts(printer_state.status))
                 self.post_print_event('PrintStarted')
+                return
 
-        elif next_state_str == 'Offline':
-            pass
+        if cur_state == PrinterState.STATE_PAUSED and prev_state == PrinterState.STATE_PRINTING:
+            self.post_print_event('PrintPaused')
+            return
 
-        elif next_state_str == 'Paused':
-            if prev_state_str != 'Paused':
-                self.post_print_event('PrintPaused')
-
-        elif next_state_str == 'Error':
-            if prev_state_str != 'Error':
-                self.post_print_event('PrintFailed')
-                printer_state.current_print_ts = -1
-
-        elif next_state_str == 'Operational':
-            if prev_state_str in ('Paused', 'Printing'):
+        if cur_state == PrinterState.STATE_OPERATIONAL and prev_state in PrinterState.ACTIVE_STATES:
                 _state = data['status'].get('print_stats', {}).get('state')
                 if _state == 'cancelled':
                     self.post_print_event('PrintCancelled')
-                    # somehow failed is expected too
+                    # PrintFailed as well to be consistent with OctoPrint
+                    time.sleep(0.5)
                     self.post_print_event('PrintFailed')
                 elif _state == 'complete':
                     self.post_print_event('PrintDone')
@@ -390,20 +310,20 @@ class App(object):
                     _logger.error(
                         f'unexpected state "{_state}", please report.')
 
-                printer_state.current_print_ts = -1
+                printer_state.set_current_print_ts(-1)
+                return
+
+        self.server_conn.post_status_update_to_server()
 
     def process_server_msg(self, msg):
         _logger.debug(f'Received from server: {msg}')
-        need_status_boost = False
 
         if 'remote_status' in msg:
             self.model.remote_status.update(msg['remote_status'])
-            need_status_boost = True
             if self.model.remote_status['viewing']:
                 self.jpeg_poster.need_viewing_boost.set()
 
         if 'commands' in msg:
-            need_status_boost = True
             for command in msg['commands']:
                 if command['cmd'] == 'pause':
                     # FIXME do we need this dance?
@@ -423,7 +343,6 @@ class App(object):
                 #    self.start_print(**command.get('args'))
 
         if 'passthru' in msg:
-            need_status_boost = True
             passthru = msg['passthru']
             target = (passthru.get('target'), passthru.get('func'))
             args = passthru.get('args', ())
@@ -453,12 +372,6 @@ class App(object):
         if msg.get('janus') and self.janus:
             self.janus.pass_to_janus(msg.get('janus'))
 
-        if need_status_boost:
-            self.boost_status_update()
-
-    def boost_status_update(self):
-        self.server_conn.status_update_booster = 20
-
     def _process_download_message(self, ack_ref: str, gcode_file: Dict) -> None:
         if (
             not self.model.downloading_gcode_file and
@@ -478,7 +391,7 @@ class App(object):
             return {'error': 'Currently downloading or printing!'}
 
     def _process_jog_message(self, ack_ref: str, axes_dict) -> None:
-        if not self.moonrakerconn or not self.moonrakerconn.ready:
+        if not self.moonrakerconn:
             return {
                         'error': 'Printer is not connected!',
                     }
@@ -498,7 +411,7 @@ class App(object):
         )
 
     def _process_home_message(self, ack_ref: str, axes: List[str]) -> None:
-        if not self.moonrakerconn or not self.moonrakerconn.ready:
+        if not self.moonrakerconn:
             return {
                         'error': 'Printer is not connected!',
                     }

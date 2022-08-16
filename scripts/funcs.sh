@@ -23,7 +23,7 @@ report_status() {
 
 banner() {
   echo -e "${cyan}"
-  cat $(dirname "$0")/scripts/banner
+  cat "${OBICO_DIR}/scripts/banner"
   echo -e "${default}"
 }
 
@@ -51,6 +51,16 @@ oops() {
                                 | |
                                 |_|
 
+
+EOF
+}
+
+need_help() {
+  cat <<EOF
+Need help? Stop by:
+
+- The Obico's help docs: https://obico.io/help/
+- The Obico community: https://obico.io/discord/
 
 EOF
 }
