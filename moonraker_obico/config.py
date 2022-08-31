@@ -144,6 +144,10 @@ class LoggingConfig:
     level: str = 'DEBUG'
 
 
+@dataclasses.dataclass
+class MiscConfig:
+    klipper4a: bool
+
 class Config:
 
     def __init__(self, config_path: str):
@@ -205,7 +209,14 @@ class Config:
             'misc', 'sentry_opt',
             fallback='out'
         )
-
+        
+        self.misc_config = MiscConfig(
+            klipper4a=config.get(
+                'misc', 'klipper4a',
+                fallback='false'
+            )
+        )
+        
         self._config = config
 
 
