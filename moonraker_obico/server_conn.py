@@ -37,8 +37,7 @@ class ServerConn:
                 self.ss = None
 
         def on_server_ws_open(ws):
-            if self.ss and self.ss.ws and self.ss.ws == ws:
-                self.post_status_update_to_server() # Make sure an update is sent asap so that the server can rely on the availability of essential info such as agent.version
+            self.post_status_update_to_server(with_config=True) # Make sure an update is sent asap so that the server can rely on the availability of essential info such as agent.version
 
         def on_message(ws, msg):
             self.process_server_msg(json.loads(msg))
@@ -78,27 +77,16 @@ class ServerConn:
         except queue.Full:
             _logger.warning("Server message queue is full, msg dropped")
 
-    def post_status_update_to_server(self, print_event: Optional[str] = None,  config: Optional[Config] = None):
-        self.send_ws_msg_to_server(self.printer_state.to_dict(print_event=print_event, config=config))
+    def post_status_update_to_server(self, print_event: Optional[str] = None, with_config: Optional[bool] = False):
+        self.send_ws_msg_to_server(self.printer_state.to_dict(print_event=print_event, with_config=with_config))
         self.status_posted_to_server_ts = time.time()
 
 
     ## REST API part of the server connection
 
-    @backoff.on_predicate(backoff.expo, max_value=1200)
     def get_linked_printer(self):
-        if not self.config.server.auth_token:
-            raise Exception('auth_token not configured. Exiting the process...')
-
-        try:
-            resp = self.send_http_request('GET', '/api/v1/octo/printer/', raise_exception=True)
-        except Exception:
-            return None  # Triggers a backoff
-
-        printer = resp.json()['printer']
-        _logger.info('Linked printer: {}'.format(printer))
-
-        return printer
+        resp = self.send_http_request('GET', '/api/v1/octo/printer/', raise_exception=True)
+        return resp.json()['printer']
 
 
     def send_http_request(

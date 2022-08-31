@@ -5,8 +5,8 @@ from configparser import ConfigParser
 from urllib.parse import urlparse
 
 import raven  # type: ignore
-from .version import VERSION
-from .utils import SentryWrapper, get_tags
+from moonraker_obico.version import VERSION
+from moonraker_obico.utils import SentryWrapper, get_tags
 
 
 @dataclasses.dataclass
@@ -55,14 +55,10 @@ class ServerConfig:
 
 @dataclasses.dataclass
 class WebcamConfig:
-    disable_video_streaming: bool = False
-    snapshot_url: str = ''
-    snapshot_ssl_validation: bool = False
-    stream_url: str = ''
-    flip_h: bool = False
-    flip_v: bool = False
-    rotate_90: bool = False
-    aspect_ratio_169: bool = False
+
+    def __init__(self, webcam_config_section):
+        self.webcam_config_section = webcam_config_section
+        self.moonraker_webcam_config = {}
 
     def update_from_moonraker(self, mr_conn):
 
@@ -72,8 +68,12 @@ class WebcamConfig:
         if result:
             # TODO: Just pick the last webcam before we have a way to support multiple cameras
             for cfg in result.get('value', {}).values():
-                self.snapshot_url = self.webcam_full_url(cfg.get('urlSnapshot', None))
-                self.stream_url = self.webcam_full_url(cfg.get('urlStream', None))
+                self.moonraker_webcam_config = dict(
+                    snapshot_url = cfg.get('urlSnapshot', None),
+                    stream_url = cfg.get('urlStream', None),
+                    flip_h = cfg.get('flipX', False),
+                    flip_v = cfg.get('flipY', False),
+                )
             return
 
         # webcam configs not found in the standard location. Try fluidd's flavor
@@ -84,11 +84,47 @@ class WebcamConfig:
                 if not cfg.get('enabled', False):
                     continue
 
-                self.stream_url = self.webcam_full_url(cfg.get('url', None))
+                self.moonraker_webcam_config = dict(
+                    stream_url = cfg.get('url', None),
+                    flip_h = cfg.get('flipX', False),
+                    flip_v = cfg.get('flipY', False),
+                )
             return
 
         #TODO: Send notification to user that webcam configs not found when moonraker's announcement api makes to stable
 
+
+    @property
+    def snapshot_url(self):
+        return self.webcam_full_url(self.webcam_config_section.get('snapshot_url') or self.moonraker_webcam_config.get('snapshot_url'))
+
+    @property
+    def disable_video_streaming(self):
+        return self.webcam_config_section.getboolean('disable_video_streaming', False)
+
+    @property
+    def snapshot_ssl_validation(self):
+        return False
+
+    @property
+    def stream_url(self):
+        return self.webcam_full_url(self.webcam_config_section.get('stream_url') or self.moonraker_webcam_config.get('stream_url'))
+
+    @property
+    def flip_h(self):
+        return self.webcam_config_section.getboolean('flip_h') or self.moonraker_webcam_config.get('flip_h')
+
+    @property
+    def flip_v(self):
+        return self.webcam_config_section.getboolean('flip_v') or self.moonraker_webcam_config.get('flip_v')
+
+    @property
+    def rotate_90(self):
+        return self.webcam_config_section.getboolean('rotate_90', False)
+
+    @property
+    def aspect_ratio_169(self):
+        return self.webcam_config_section.getboolean('aspect_ratio_169', False)
 
     @classmethod
     def webcam_full_url(cls, url):
@@ -108,38 +144,16 @@ class LoggingConfig:
     level: str = 'DEBUG'
 
 
-@dataclasses.dataclass
-class MiscConfig:
-    klipper4a: bool
-
-@dataclasses.dataclass
 class Config:
-    moonraker: MoonrakerConfig
-    server: ServerConfig
-    webcam: WebcamConfig
-    logging: LoggingConfig
-    misc: MiscConfig
 
-    _config_path: str
-    _config: ConfigParser
+    def __init__(self, config_path: str):
+        self._heater_mapping = {}
 
-    sentry_opt: str = 'out'
-
-    def write(self) -> None:
-        with open(self._config_path, 'w') as f:
-            self._config.write(f)
-
-    def update_tsd_auth_token(self, auth_token: str):
-        self.server.auth_token = auth_token
-        self._config.set('server', 'auth_token', auth_token)
-        self.write()
-
-    @classmethod
-    def load_from(cls, config_path: str) -> 'Config':
+        self._config_path = config_path
         config = ConfigParser()
         config.read([config_path, ])
 
-        moonraker_config = MoonrakerConfig(
+        self.moonraker = MoonrakerConfig(
             host=config.get(
                 'moonraker', 'host',
                 fallback='127.0.0.1'
@@ -154,7 +168,7 @@ class Config:
             ),
         )
 
-        tsd_config = ServerConfig(
+        self.server = ServerConfig(
             url=config.get(
                 'server', 'url',
                 fallback='https://app.obico.io'),
@@ -174,41 +188,9 @@ class Config:
             )
         )
 
-        webcam_config = WebcamConfig(
-            snapshot_url=config.get(
-                'webcam', 'snapshot_url',
-                fallback=''),
-            snapshot_ssl_validation=config.getboolean(
-                'webcam', 'snapshot_ssl_validation',
-                fallback=False
-            ),
-            stream_url=config.get(
-                'webcam', 'stream_url',
-                fallback='http://127.0.0.1:8080/?action=stream'
-            ),
-            flip_h=config.getboolean(
-                'webcam', 'flip_h',
-                fallback=False
-            ),
-            flip_v=config.getboolean(
-                'webcam', 'flip_v',
-                fallback=False
-            ),
-            rotate_90=config.getboolean(
-                'webcam', 'rotate_90',
-                fallback=False
-            ),
-            aspect_ratio_169=config.getboolean(
-                'webcam', 'aspect_ratio_169',
-                fallback=False
-            ),
-            disable_video_streaming=config.getboolean(
-                'webcam', 'disable_video_streaming',
-                fallback=False
-            ),
-        )
+        self.webcam = WebcamConfig(webcam_config_section=config['webcam'])
 
-        logging_config = LoggingConfig(
+        self.logging = LoggingConfig(
             path=config.get(
                 'logging', 'path',
                 fallback=''
@@ -219,28 +201,41 @@ class Config:
             ),
 		)
 
-        sentry_opt = config.get(
+        self.sentry_opt = config.get(
             'misc', 'sentry_opt',
             fallback='out'
         )
-        
-        misc_config = MiscConfig(
-            klipper4a=config.get(
-                'misc', 'klipper4a',
-                fallback='false'
-            )
-		)
 
-        return Config(
-            moonraker=moonraker_config,
-            server=tsd_config,
-            webcam=webcam_config,
-            logging=logging_config,
-            misc=misc_config,
-            _config=config,
-            _config_path=config_path,
-            sentry_opt=sentry_opt,
-        )
+        self._config = config
+
+
+    def write(self) -> None:
+        with open(self._config_path, 'w') as f:
+            self._config.write(f)
+
+    def update_server_auth_token(self, auth_token: str):
+        self.server.auth_token = auth_token
+        self._config.set('server', 'auth_token', auth_token)
+        self.write()
+
+    def update_heater_mapping(self, available_heaters):
+        tool_no = 0
+        for heater in sorted(available_heaters):
+            if heater == "heater_bed":
+                self._heater_mapping['heater_bed'] = 'bed'
+            else:
+                self._heater_mapping[heater] = f'tool{tool_no}'
+                tool_no += 1
+
+    def get_mapped_server_heater_name(self, mr_heater_name):
+        return self._heater_mapping.get(mr_heater_name)
+
+    def get_mapped_mr_heater_name(self, server_heater_name):
+        mr_heater_name = list(self._heater_mapping.keys())[list(self._heater_mapping.values()).index(server_heater_name)]
+        return mr_heater_name
+
+    def all_mr_heaters(self):
+         return self._heater_mapping.keys()
 
     def get_sentry(self):
         sentryClient = raven.Client(

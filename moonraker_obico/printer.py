@@ -12,11 +12,13 @@ class PrinterState:
     STATE_PRINTING = 'Printing'
     STATE_PAUSED = 'Paused'
     STATE_ERROR = 'Error'
+    STATE_CANCELLING = 'Cancelling'
 
     ACTIVE_STATES = [STATE_PRINTING, STATE_PAUSED]
 
-    def __init__(self):
+    def __init__(self, app_config: Config):
         self._mutex = threading.RLock()
+        self.app_config = app_config
         self.status = {}
         self.current_print_ts = None
 
@@ -47,10 +49,9 @@ class PrinterState:
             'webhooks', {}
         ).get('state', 'disconnected')
 
-        if klippy_state in ('disconnected', 'startup'):
+        # TODO: We need to have better understanding on the webhooks.state.
+        if klippy_state != 'ready':
             return PrinterState.STATE_OFFLINE
-        elif klippy_state != 'ready':
-            return PrinterState.STATE_ERROR
 
         return {
             'standby': PrinterState.STATE_OPERATIONAL,
@@ -61,19 +62,20 @@ class PrinterState:
         }.get(data.get('print_stats', {}).get('state', 'unknown'), PrinterState.STATE_ERROR)
 
     def to_dict(
-        self, print_event: Optional[str] = None, config: Optional[Config] = None
+        self, print_event: Optional[str] = None, with_config: Optional[bool] = False,
     ) -> Dict:
         with self._mutex:
             data = {
                 'current_print_ts': self.current_print_ts,
-                'octoprint_data': self.to_octoprint_state(),
+                'status': self.to_status(),
             } if self.current_print_ts is not None else {}      # Print status is un-deterministic when current_print_ts is None
 
             if print_event:
-                data['octoprint_event'] = {'event_type': print_event}
+                data['event'] = {'event_type': print_event}
 
-            if config:
-                data["octoprint_settings"] = dict(
+            if with_config:
+                config = self.app_config
+                data["settings"] = dict(
                     webcam=dict(
                         flipV=config.webcam.flip_v,
                         flipH=config.webcam.flip_h,
@@ -87,14 +89,14 @@ class PrinterState:
                 )
             return data
 
-    def to_octoprint_state(self) -> Dict:
+    def to_status(self) -> Dict:
         with self._mutex:
             state = self.get_state_from_status(self.status)
             print_stats = self.status.get('print_stats') or dict()
             virtual_sdcard = self.status.get('virtual_sdcard') or dict()
             error_text = (
                 print_stats.get('message', 'Unknown error')
-                if state == 'Error'
+                if state == PrinterState.STATE_ERROR
                 else ''
             )
 
@@ -102,18 +104,8 @@ class PrinterState:
             heaters = self.status.get('heaters', {}).get('available_heaters', ())
             for heater in heaters:
                 data = self.status.get(heater, {})
-                if heater.startswith('extruder'):
-                    try:
-                        tool_no = int(heater[8:])
-                    except ValueError:
-                        tool_no = 0
-                    name = f'tool{tool_no}'
-                elif heater == "heater_bed":
-                    name = 'bed'
-                else:
-                    continue
 
-                temps[name] = {
+                temps[self.app_config.get_mapped_server_heater_name(heater)] = {
                     'actual': round(data.get('temperature', 0.), 2),
                     'offset': 0,
                     'target': data.get('target', 0.),
@@ -122,7 +114,7 @@ class PrinterState:
             filepath = print_stats.get('filename', '')
             filename = pathlib.Path(filepath).name if filepath else ''
 
-            if state == 'Offline':
+            if state == PrinterState.STATE_OFFLINE:
                 return {}
 
             completion = self.status.get('virtual_sdcard', {}).get('progress')
@@ -134,14 +126,14 @@ class PrinterState:
                 'state': {
                     'text': error_text or state,
                     'flags': {
-                        'operational': state not in ['Error', 'Offline'],
-                        'paused': state == 'Paused',
-                        'printing': state == 'Printing',
-                        'cancelling': state == 'Cancelling',
+                        'operational': state not in [PrinterState.STATE_ERROR, PrinterState.STATE_OFFLINE],
+                        'paused': state == PrinterState.STATE_PAUSED,
+                        'printing': state == PrinterState.STATE_PRINTING,
+                        'cancelling': state == PrinterState.STATE_CANCELLING,
                         'pausing': False,
-                        'error': state == 'Error',
-                        'ready': state == 'Operational',
-                        'closedOrError': state in ['Error', 'Offline'],
+                        'error': state == PrinterState.STATE_ERROR,
+                        'ready': state == PrinterState.STATE_OPERATIONAL,
+                        'closedOrError': False,  # OctoPrint uses this flag to indicate the printer is connectable. It should always be false until we support connecting moonraker to printer
                     }
                 },
                 'currentZ': None,
