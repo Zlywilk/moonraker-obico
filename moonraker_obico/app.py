@@ -75,14 +75,16 @@ class App(object):
     def wait_for_auth_token(self, args):
         while True:
             config = Config(args.config_path)
+            if args.log_path:
+                config.logging.path = args.log_path
+            if args.debug:
+                config.logging.level = 'DEBUG'
+            setup_logging(config.logging)
+
             if config.server.auth_token:
+                _logger.info('Fetching linked printer...')
                 linked_printer = ServerConn(config, None, None, None).get_linked_printer()
 
-                if args.log_path:
-                    config.logging.path = args.log_path
-                if args.debug:
-                    config.logging.level = 'DEBUG'
-                setup_logging(config.logging)
 
                 _logger.info(f'starting moonraker-obico (v{VERSION})')
                 _logger.info('Linked printer: {}'.format(linked_printer))
@@ -106,18 +108,18 @@ class App(object):
         # _default_int_handler = signal.signal(signal.SIGINT, self.interrupted)
         # _default_term_handler = signal.signal(signal.SIGTERM, self.interrupted)
 
+        # Blocking call. When continued, server is guaranteed to be properly configured, self.model.linked_printer existed.
         self.wait_for_auth_token(args)
         get_tags()
 
-        _logger.debug(self.model.config.server)
+        _cfg = self.model.config._config
+        _logger.debug(f'moonraker-obico configurations: { {section: dict(_cfg[section]) for section in _cfg.sections()} }')
         self.server_conn = ServerConn(self.model.config, self.model.printer_state, self.process_server_msg, self.sentry, )
         self.moonrakerconn = MoonrakerConn(self.model.config, self.sentry, self.push_event,)
         self.janus = JanusConn(self.model.config, self.server_conn, self.sentry)
         self.jpeg_poster = JpegPoster(self.model, self.server_conn, self.sentry)
 
-        # Blocking call. When continued, server is guaranteed to be properly configured, self.model.linked_printer existed.
-        self.model.linked_printer = self.server_conn.get_linked_printer()
-
+        self.moonrakerconn.update_webcam_config_from_moonraker()
         self.sentry.user_context({'id': self.model.config.server.auth_token})
 
         if not self.model.config.webcam.disable_video_streaming:
@@ -213,8 +215,8 @@ class App(object):
                 _logger.warning(f'error response from moonraker, {event}')
 
             elif event.data.get('method', '') in ('notify_klippy_disconnected', 'notify_klippy_shutdown'):
-                # notify_klippy_disconnected -> Click “Restart Klipper” or “Firmware restart” (same result)
-                # notify_klippy_shutdown -> Unplug printer USB cable
+                # Click "Restart Klipper" or "Firmware restart" (same result) -> notify_klippy_disconnected
+                # Unplug printer USB cable -> notify_klippy_shutdown
                 # clear app's klippy state to indicate the loss of connection to the printer
                 self._received_klippy_update({"status": {},})
 
@@ -334,6 +336,8 @@ class App(object):
                     self.post_print_event('PrintFailed')
                 elif _state == 'complete':
                     self.post_print_event('PrintDone')
+                elif _state == 'error':
+                    self.post_print_event('PrintFailed')
                 else:
                     # FIXME
                     _logger.error(
