@@ -9,9 +9,9 @@ import sys
 from collections import deque
 from threading import Thread
 import psutil
+import backoff
 
-
-from .utils import get_image_info, pi_version, get_tags, to_unicode
+from .utils import get_image_info, pi_version, to_unicode
 from .janus import JANUS_SERVER
 from .webcam_capture import capture_jpeg
 from .config import Config
@@ -46,21 +46,25 @@ def bitrate_for_dim(img_w, img_h):
     else:
         return 3000*1000
 
-def cpu_watch_dog(watched_process, max, interval):
+def cpu_watch_dog(watched_process, max, interval, server_conn):
 
-    def watch_process_cpu(watched_process, max, interval):
+    def watch_process_cpu(watched_process, max, interval, server_conn):
         while True:
             if not watched_process.is_running():
                 return
 
             cpu_pct = watched_process.cpu_percent(interval=None)
             if cpu_pct > max:
-				# TODO: Send notification to user when such thing is available on moonraker
-                pass
+                server_conn.post_printer_event_to_server(
+                    'moonraker-obico: Webcam Streaming Using Excessive CPU',
+                    'The webcam streaming uses excessive CPU. This may negatively impact your print quality, or cause webcam streaming issues.',
+                    event_class='WARNING',
+                    info_url='https://obico.io/docs/user-guides/webcam-streaming-resolution-framerate-klipper/',
+                )
 
             time.sleep(interval)
 
-    watch_thread = Thread(target=watch_process_cpu, args=(watched_process, max, interval))
+    watch_thread = Thread(target=watch_process_cpu, args=(watched_process, max, interval, server_conn))
     watch_thread.daemon = True
     watch_thread.start()
 
@@ -84,9 +88,10 @@ def set_ffmpeg_if_needed():
 
 class WebcamStreamer:
 
-    def __init__(self, app_model, sentry):
+    def __init__(self, app_model, server_conn, sentry):
         self.config = app_model.config
         self.app_model = app_model
+        self.server_conn = server_conn
         self.sentry = sentry
 
         self.ffmpeg_proc = None
@@ -102,12 +107,24 @@ class WebcamStreamer:
             self.ffmpeg_from_mjpeg()
 
         except Exception:
-            self.sentry.captureException(tags=get_tags())
+            self.sentry.captureException()
+            self.server_conn.post_printer_event_to_server(
+                'moonraker-obico: Webcam Streaming Failed',
+                'The webcam streaming failed to start. Obico is now streaming at 0.1 FPS.',
+                event_class='WARNING',
+                info_url='https://www.obico.io/docs/user-guides/webcam-stream-stuck-at-1-10-fps/',
+            )
 
-            #TODO: sent notification to user
-            raise
 
     def ffmpeg_from_mjpeg(self):
+
+        @backoff.on_exception(backoff.expo, Exception, max_tries=20)  # Retry 20 times in case the webcam service starts later than Obico service
+        def get_webcam_resolution(webcam_config):
+            jpg = capture_jpeg(webcam_config, force_stream_url=True)
+            if not jpg:
+                raise Exception('Not a valid jpeg source. Quiting ffmpeg.')
+
+            return get_image_info(jpg)
 
         def h264_encoder():
             test_video = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bin', 'test-video.mp4')
@@ -116,29 +133,19 @@ class WebcamStreamer:
                 ffmpeg_test_proc = psutil.Popen('{} -re -i {} -pix_fmt yuv420p -vcodec {} -an -f rtp rtp://localhost:8014?pkt_size=1300'.format(FFMPEG, test_video, encoder).split(' '), stdout=FNULL, stderr=FNULL)
                 if ffmpeg_test_proc.wait() == 0:
                     return encoder
-            return None
+            raise Exception('No ffmpeg found, or ffmpeg does NOT support h264_omx/h264_v4l2m2m encoding.')
 
         set_ffmpeg_if_needed()
-
         encoder = h264_encoder()
-        if not encoder:
-            # TODO: notification to user
-            return
 
         webcam_config = self.config.webcam
 
-        jpg = capture_jpeg(webcam_config)
+        (_, img_w, img_h) = get_webcam_resolution(webcam_config)
 
-        if not jpg:
-            _logger.warning('Not a valid jpeg source. Quiting ffmpeg.')
-            return
-
-        (_, img_w, img_h) = get_image_info(jpg)
         stream_url = webcam_config.stream_url
 
         if not stream_url:
-            # TODO: notification to user
-            return
+            raise Exception('stream_url not configured. Unable to stream the webcam.')
 
 
         bitrate = bitrate_for_dim(img_w, img_h)
@@ -150,16 +157,25 @@ class WebcamStreamer:
         self.start_ffmpeg('-re -i {} -filter:v fps={} -b:v {} -pix_fmt yuv420p -s {}x{} -flags:v +global_header -vcodec {}'.format(stream_url, fps, bitrate, img_w, img_h, encoder))
 
     def start_ffmpeg(self, ffmpeg_args):
-        ffmpeg_cmd = '{} {} -bsf dump_extra -an -f rtp rtp://{}:8004?pkt_size=1300'.format(FFMPEG, ffmpeg_args, JANUS_SERVER)
+        ffmpeg_cmd = '{} -loglevel error {} -bsf dump_extra -an -f rtp rtp://{}:8004?pkt_size=1300'.format(FFMPEG, ffmpeg_args, JANUS_SERVER)
 
         _logger.debug('Popen: {}'.format(ffmpeg_cmd))
         FNULL = open(os.devnull, 'w')
         self.ffmpeg_proc = psutil.Popen(ffmpeg_cmd.split(' '), stdin=subprocess.PIPE, stdout=FNULL, stderr=subprocess.PIPE)
         self.ffmpeg_proc.nice(10)
 
-        cpu_watch_dog(self.ffmpeg_proc, max=80, interval=20)
+        try:
+            returncode = self.ffmpeg_proc.wait(timeout=10) # If ffmpeg fails, it usually does so without 10s
+            (stdoutdata, stderrdata) = self.ffmpeg_proc.communicate()
+            msg = 'STDOUT:\n{}\nSTDERR:\n{}\n'.format(stdoutdata, stderrdata)
+            _logger.error(msg)
+            raise Exception('ffmpeg quit! This should not happen. Exit code: {}'.format(returncode))
+        except psutil.TimeoutExpired:
+           pass
 
-        def monitor_ffmpeg_process():  # It's pointless to restart ffmpeg without calling pi_camera.record with the new input. Just capture unexpected exits not to see if it's a big problem
+        cpu_watch_dog(self.ffmpeg_proc, max=80, interval=20, server_conn=self.server_conn)
+        def monitor_ffmpeg_process():
+            # It seems important to drain the stderr output of ffmpeg, otherwise the whole process will get clogged
             ring_buffer = deque(maxlen=50)
             while True:
                 err = to_unicode(self.ffmpeg_proc.stderr.readline(), errors='replace')
@@ -170,7 +186,7 @@ class WebcamStreamer:
                     returncode = self.ffmpeg_proc.wait()
                     msg = 'STDERR:\n{}\n'.format('\n'.join(ring_buffer))
                     _logger.error(msg)
-                    self.sentry.captureMessage('ffmpeg quit! This should not happen. Exit code: {}'.format(returncode), tags=get_tags())
+                    self.sentry.captureMessage('ffmpeg quit! This should not happen. Exit code: {}'.format(returncode))
                     return
                 else:
                     ring_buffer.append(err)
@@ -178,6 +194,7 @@ class WebcamStreamer:
         ffmpeg_thread = Thread(target=monitor_ffmpeg_process)
         ffmpeg_thread.daemon = True
         ffmpeg_thread.start()
+
 
     def restore(self):
         self.shutting_down = True

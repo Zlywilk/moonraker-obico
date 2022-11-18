@@ -6,11 +6,13 @@ import backoff
 import queue
 import bson
 import json
+from collections import deque
 
-from .utils import ExpoBackoff, get_tags
+from .utils import ExpoBackoff
 from .ws import WebSocketClient, WebSocketConnectionException
 from .config import Config
 from .printer import PrinterState
+from .webcam_capture import capture_jpeg
 
 
 _logger = logging.getLogger('obico.server_conn')
@@ -27,6 +29,7 @@ class ServerConn:
         self.status_posted_to_server_ts = 0
         self.ss = None
         self.message_queue_to_server = queue.Queue(maxsize=50)
+        self.printer_events_posted = deque(maxlen=20)
 
 
     ## WebSocket part of the server connection
@@ -75,7 +78,7 @@ class ServerConn:
                 _logger.warning(e)
                 server_ws_backoff.more(e)
             except Exception as e:
-                self.sentry.captureException(tags=get_tags())
+                self.sentry.captureException()
                 server_ws_backoff.more(e)
 
 
@@ -95,6 +98,26 @@ class ServerConn:
     def get_linked_printer(self):
         resp = self.send_http_request('GET', '/api/v1/octo/printer/', raise_exception=True)
         return resp.json()['printer']
+
+
+    def post_printer_event_to_server(self, event_title, event_text, event_type='PRINTER_ERROR', event_class='ERROR', attach_snapshot=False, **kwargs):
+        event_data = dict(event_title=event_title, event_text=event_text, event_type=event_type, event_class=event_class, **kwargs)
+        self.send_ws_msg_to_server({'passthru': {'printer_event': event_data}})
+
+        # We dont' want to bombard the server with repeated events. So we keep track of the events sent since last restart.
+        # However, there are probably situations in the future repeated events do need to be propagated to the server.
+        if event_title in self.printer_events_posted:
+            return
+
+        self.printer_events_posted.append(event_title)
+
+        files = None
+        if attach_snapshot:
+            try:
+                files = {'snapshot': capture_jpeg(self)}
+            except:
+                pass
+        resp = self.send_http_request('POST', '/api/v1/octo/printer_events/', timeout=60, raise_exception=True, files=files, data=event_data)
 
 
     def send_http_request(

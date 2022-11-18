@@ -12,8 +12,6 @@ import logging
 import time
 import threading
 
-from .utils import get_tags
-
 POST_PIC_INTERVAL_SECONDS = 10.0
 if os.environ.get('DEBUG'):
     POST_PIC_INTERVAL_SECONDS = 3.0
@@ -23,10 +21,10 @@ _logger = logging.getLogger('obico.webcam_capture')
 
 @backoff.on_exception(backoff.expo, Exception, max_tries=3)
 @backoff.on_predicate(backoff.expo, max_tries=3)
-def capture_jpeg(webcam_config):
+def capture_jpeg(webcam_config, force_stream_url=False):
     snapshot_url = webcam_config.snapshot_url
 
-    if snapshot_url:
+    if snapshot_url and not force_stream_url:
         snapshot_validate_ssl = webcam_config.snapshot_ssl_validation
 
         _logger.debug(f'GET {snapshot_url}')
@@ -131,4 +129,4 @@ class JpegPoster:
                 self.last_jpg_post_ts = time.time()
                 self.post_pic_to_server(viewing_boost=False)
             except:
-                self.sentry.captureException(tags=get_tags())
+                self.sentry.captureException()

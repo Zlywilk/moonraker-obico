@@ -17,6 +17,12 @@ from sarge import run, Capture
 import backoff
 import requests
 
+import sentry_sdk
+from sentry_sdk.integrations.threading import ThreadingIntegration
+from sentry_sdk.integrations.logging import LoggingIntegration
+
+from .version import VERSION
+
 _logger = logging.getLogger('obico.utils')
 
 DEBUG = os.environ.get('DEBUG')
@@ -24,7 +30,7 @@ DEBUG = os.environ.get('DEBUG')
 
 class ExpoBackoff:
 
-    def __init__(self, max_seconds, max_attempts=3):
+    def __init__(self, max_seconds, max_attempts=0):
         self.attempts = 0
         self.max_seconds = max_seconds
         self.max_attempts = max_attempts
@@ -34,48 +40,71 @@ class ExpoBackoff:
 
     def more(self, e):
         self.attempts += 1
-        if (
-            self.max_attempts is not None and
-            self.attempts >= self.max_attempts
-        ):
-            _logger.error('giving up on error: %s' % (e))
+        if self.max_attempts > 0 and self.attempts > self.max_attempts:
+            _logger.error('Giving up after %d attempts on error: %s' % (self.attempts, e))
             raise e
         else:
-            delay = self.get_delay(self.attempts, self.max_seconds)
-            _logger.error('backing off %f seconds: %s' % (delay, e))
+            delay = 2 ** (self.attempts-3)
+            if delay > self.max_seconds:
+                delay = self.max_seconds
+            delay *= 0.5 + random.random()
+            _logger.error('Attempt %d - backing off %f seconds: %s' % (self.attempts, delay, e))
 
             time.sleep(delay)
-
-    @classmethod
-    def get_delay(cls, attempts, max_seconds):
-        delay = 2 ** (attempts - 3)
-        if delay > max_seconds:
-            delay = max_seconds
-        delay *= 0.5 + random.random()
-        return delay
 
 
 class SentryWrapper:
 
-    def __init__(self, sentryClient):
-        self.sentryClient = sentryClient
+    def __init__(self, enabled: bool) -> None:
+        self._enabled = enabled
+        if not self._enabled:
+            return
 
-    def captureException(self, *args, **kwargs):
+        # https://github.com/getsentry/sentry-python/issues/149
+        def before_send(event, hint):
+            if 'exc_info' in hint:
+                exc_type, exc_value, tb = hint['exc_info']
+                errors_to_ignore = (requests.exceptions.RequestException,)
+                if isinstance(exc_value, errors_to_ignore):
+                    return None
+            return event
+
+        sentry_sdk.init(
+            dsn='https://89fc4cf9318d46b1bfadc03c9d34577c@sentry.obico.io/8',
+            default_integrations=False,
+            integrations=[
+                ThreadingIntegration(propagate_hub=True), # Make sure context are propagated to sub-threads.
+                LoggingIntegration(
+                    level=logging.INFO, # Capture info and above as breadcrumbs
+                    event_level=None  # Send logs as events above a logging level, disabled it
+                ),
+            ],
+            before_send=before_send,
+
+            # If you wish to associate users to errors (assuming you are using
+            # django.contrib.auth) you may enable sending PII data.
+            send_default_pii=True,
+
+            release='moonraker-obico@'+VERSION,
+        )
+
+    def enabled(self) -> bool:
+        return self._enabled
+
+    def init_context(self, auth_token: str) -> None:
+        if self.enabled():
+            sentry_sdk.set_user({'id': auth_token})
+            for (k, v) in get_tags().items():
+                sentry_sdk.set_tag(k, v)
+
+    def captureException(self, *args, **kwargs) -> None:
         _logger.exception('')
-        if self.sentryClient:
-            self.sentryClient.captureException(*args, **kwargs)
+        if self.enabled():
+            sentry_sdk.capture_exception(*args, **kwargs)
 
-    def user_context(self, *args, **kwargs):
-        if self.sentryClient:
-            self.sentryClient.user_context(*args, **kwargs)
-
-    def tags_context(self, *args, **kwargs):
-        if self.sentryClient:
-            self.sentryClient.tags_context(*args, **kwargs)
-
-    def captureMessage(self, *args, **kwargs):
-        if self.sentryClient:
-            self.sentryClient.captureMessage(*args, **kwargs)
+    def captureMessage(self, *args, **kwargs) -> None:
+        if self.enabled():
+            sentry_sdk.capture_message(*args, **kwargs)
 
 
 def pi_version():
@@ -301,4 +330,3 @@ def pi_version():
                 return None
     except:
         return None
-

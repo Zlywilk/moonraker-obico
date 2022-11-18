@@ -13,7 +13,7 @@ import bson
 import websocket
 from collections import deque
 
-from .utils import get_tags, DEBUG
+from .utils import DEBUG
 from .ws import WebSocketClient, WebSocketConnectionException
 
 
@@ -22,7 +22,7 @@ if DEBUG:
     REQUEST_STATE_INTERVAL_SECONDS = 10
 
 _logger = logging.getLogger('obico.moonraker_conn')
-_ignore_pattern=re.compile(r'"method": "notify_proc_stat_update"|"method": "notify_gcode_response"')
+_ignore_pattern=re.compile(r'"method": "notify_proc_stat_update"')
 
 class MoonrakerConn:
     flow_step_timeout_msecs = 2000
@@ -110,6 +110,7 @@ class MoonrakerConn:
             # Check for the standard namespace for webcams
             result = self.api_get('server.database.item', raise_for_status=False, namespace='webcams')
             if result:
+                _logger.debug(f'Found config in Moonraker webcams namespace: {result}')
                 # TODO: Just pick the last webcam before we have a way to support multiple cameras
                 for cfg in result.get('value', {}).values():
                     return dict(
@@ -122,6 +123,7 @@ class MoonrakerConn:
             # webcam configs not found in the standard location. Try fluidd's flavor
             result = self.api_get('server.database.item', raise_for_status=False, namespace='fluidd', key='cameras')
             if result:
+                _logger.debug(f'Found config in Moonraker fluidd/cameras namespace: {result}')
                 # TODO: Just pick the last webcam before we have a way to support multiple cameras
                 for cfg in result.get('value', {}).get('cameras', []):
                     if not cfg.get('enabled', False):
@@ -158,7 +160,7 @@ class MoonrakerConn:
                     self.request_status_update()
 
             except Exception as e:
-                self.sentry.captureException(tags=get_tags())
+                self.sentry.captureException()
 
             time.sleep(1)
 
@@ -225,7 +227,7 @@ class MoonrakerConn:
                 _logger.warning(e)
             except Exception as e:
                 _logger.warning(e)
-                self.sentry.captureException(tags=get_tags())
+                self.sentry.captureException()
 
     def next_id(self) -> int:
         next_id = self._next_id = self._next_id + 1

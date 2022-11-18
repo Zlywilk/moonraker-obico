@@ -4,9 +4,7 @@ import re
 from configparser import ConfigParser
 from urllib.parse import urlparse
 
-import raven  # type: ignore
-from moonraker_obico.version import VERSION
-from moonraker_obico.utils import SentryWrapper, get_tags
+from moonraker_obico.utils import SentryWrapper
 
 
 @dataclasses.dataclass
@@ -227,12 +225,11 @@ class Config:
     def all_mr_heaters(self):
          return self._heater_mapping.keys()
 
-    def get_sentry(self):
-        sentryClient = raven.Client(
-            'https://89fc4cf9318d46b1bfadc03c9d34577c@sentry.obico.io/8',  # noqa
-            release=VERSION,
-            ignore_exceptions=[]
-        ) if self.sentry_opt == 'in' and self.server.canonical_endpoint_prefix().endswith('obico.io') else None
-        sentry = SentryWrapper(sentryClient)
-        sentry.tags_context(get_tags())
+    def get_sentry(self) -> SentryWrapper:
+        enabled = (
+            self.sentry_opt == 'in' and
+            self.server.canonical_endpoint_prefix().endswith('obico.io')
+        )
+        sentry = SentryWrapper(enabled=enabled)
+        sentry.init_context(auth_token=self.server.auth_token)
         return sentry

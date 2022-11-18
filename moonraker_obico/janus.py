@@ -7,7 +7,7 @@ import backoff
 import json
 import socket
 
-from .utils import ExpoBackoff, get_tags, pi_version, to_unicode
+from .utils import ExpoBackoff, pi_version, to_unicode
 from .ws import WebSocketClient
 
 _logger = logging.getLogger('obico.janus')
@@ -60,25 +60,35 @@ class JanusConn:
                         line = line.replace('{VIDEO_ENABLED}', str(video_enabled))
                         fout.write(line)
 
-        def run_janus():
-            janus_backoff = ExpoBackoff(60, max_attempts=20)
-            janus_cmd = os.path.join(JANUS_DIR, 'run_janus.sh')
-            _logger.debug('Popen: {}'.format(janus_cmd))
-            self.janus_proc = subprocess.Popen(janus_cmd.split(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        def run_janus_forever():
 
-            while not self.shutting_down:
-                line = to_unicode(self.janus_proc.stdout.readline(), errors='replace')
-                if line:
-                    _logger.debug('JANUS: ' + line.rstrip())
-                elif not self.shutting_down:
-                    self.janus_proc.wait()
-                    msg = 'Janus quit! This should not happen. Exit code: {}'.format(self.janus_proc.returncode)
-                    self.sentry.captureMessage(msg, tags=get_tags())
-                    janus_backoff.more(Exception(msg))
-                    self.janus_proc = subprocess.Popen(janus_cmd.split(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            @backoff.on_exception(backoff.expo, Exception, max_tries=5)
+            def run_janus():
+                janus_cmd = os.path.join(JANUS_DIR, 'run_janus.sh')
+                _logger.debug('Popen: {}'.format(janus_cmd))
+                self.janus_proc = subprocess.Popen(janus_cmd.split(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+                while not self.shutting_down:
+                    line = to_unicode(self.janus_proc.stdout.readline(), errors='replace')
+                    if line:
+                        _logger.debug('JANUS: ' + line.rstrip())
+                    elif not self.shutting_down:  # line == None means the process quits
+                        self.janus_proc.wait()
+                        raise Exception('Janus quit! This should not happen. Exit code: {}'.format(self.janus_proc.returncode))
+
+            try:
+                run_janus()
+            except Exception as ex:
+                self.sentry.captureException()
+                self.server_conn.post_printer_event_to_server(
+                    'moonraker-obico: Webcam Streaming Failed',
+                    'The webcam streaming failed to start. Obico is now streaming at 0.1 FPS.',
+                    event_class='WARNING',
+                    info_url='https://www.obico.io/docs/user-guides/webcam-stream-stuck-at-1-10-fps/',
+                )
 
         ensure_janus_config()
-        janus_proc_thread = Thread(target=run_janus)
+        janus_proc_thread = Thread(target=run_janus_forever)
         janus_proc_thread.daemon = True
         janus_proc_thread.start()
 
@@ -148,4 +158,4 @@ class JanusConn:
             _logger.debug(msg)
             self.server_conn.send_ws_msg_to_server(dict(janus=raw_msg))
         except:
-            self.sentry.captureException(tags=get_tags())
+            self.sentry.captureException()

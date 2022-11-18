@@ -120,11 +120,10 @@ class App(object):
         self.jpeg_poster = JpegPoster(self.model, self.server_conn, self.sentry)
 
         self.moonrakerconn.update_webcam_config_from_moonraker()
-        self.sentry.user_context({'id': self.model.config.server.auth_token})
 
         if not self.model.config.webcam.disable_video_streaming:
             _logger.info('Starting webcam streamer')
-            self.webcam_streamer = WebcamStreamer(self.model, self.sentry)
+            self.webcam_streamer = WebcamStreamer(self.model, self.server_conn, self.sentry)
             stream_thread = threading.Thread(target=self.webcam_streamer.video_pipeline)
             stream_thread.daemon = True
             stream_thread.start()
@@ -231,6 +230,11 @@ class App(object):
 
             elif event.data.get('method', '') == 'notify_history_changed':
                 self.moonrakerconn.request_status_update()
+
+            elif event.data.get('method', '') == 'notify_gcode_response':
+                msg = (event.data.get('params') or [''])[0]
+                if msg.startswith('!!'):  # It seems to an undocumented feature that some gcode errors that are critical for the users to know are recevied as notify_gcode_response with "!!"
+                    self.server_conn.post_printer_event_to_server('Moonraker Error', msg, attach_snapshot=True)
 
         elif event.name == 'status_update':
             # full state update from moonraker
